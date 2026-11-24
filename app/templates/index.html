@@ -24,6 +24,11 @@
            border-radius: 6px; }
     code { background: #e4e7eb; padding: 0.1rem 0.35rem; border-radius: 4px; }
     .hint { font-size: 0.85rem; color: #52606d; }
+    table { border-collapse: collapse; width: 100%; font-size: 0.92rem;
+            background: #fff; }
+    th, td { border: 1px solid #cbd2d9; padding: 0.4rem 0.6rem; text-align: left; }
+    th { background: #e4e7eb; }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; }
   </style>
 </head>
 <body>
@@ -59,7 +64,8 @@
 
   <section>
     <h2>3. 下载已保存的合并摘要</h2>
-    <p class="hint">按月份和资源号下载逐位置取最大值后的合并 JSON（无报送记录时返回 404）。</p>
+    <p class="hint">按月份和资源号下载逐位置取最大值后的合并 JSON（含月度读者规模预估
+      <code>estimate</code> 字段；无报送记录时返回 404）。</p>
     <form id="dl-form" onsubmit="event.preventDefault();
         var m=this.month.value.trim(), r=this.resource.value.trim();
         window.location='{{ url_for('download_merged', month='__M__', resource='__R__') }}'
@@ -68,6 +74,37 @@
       <label>资源号<input type="text" name="resource" required placeholder="ER-0001"></label>
       <button class="tertiary" type="submit">下载合并摘要</button>
     </form>
+  </section>
+
+  <section>
+    <h2>4. 月度读者规模预估</h2>
+    <p class="hint">按合并摘要的 128 个寄存器做 HLL 标准原始估计：全零摘要为 0；
+      稀疏摘要按非零寄存器数做空槽修正（线性计数）；结果保留两位小数。
+      换报或撤回后，本页与下载 JSON 中的预估始终为同一版本。</p>
+    {% if merged_list %}
+    <table>
+      <thead>
+        <tr>
+          <th>月份</th><th>资源号</th><th>非零寄存器数</th>
+          <th>预估读者数</th><th>更新时间</th><th>合并摘要</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for item in merged_list %}
+        <tr>
+          <td>{{ item.month }}</td>
+          <td>{{ item.resource }}</td>
+          <td class="num">{{ item.nonzero_registers }}</td>
+          <td class="num">{{ '%.2f'|format(item.estimate) }}</td>
+          <td>{{ item.updated_at }}</td>
+          <td><a href="{{ url_for('download_merged', month=item.month, resource=item.resource) }}">下载 JSON</a></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="hint">尚无任何合并摘要，报送后此处按月份、资源号展示预估读者数。</p>
+    {% endif %}
   </section>
 </body>
 </html>

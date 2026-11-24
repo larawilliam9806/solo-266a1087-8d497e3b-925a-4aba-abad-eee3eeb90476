@@ -1,4 +1,4 @@
-"""Flask 报送页：按月份、资源号、馆号上传 JSON，支持换报、撤回与下载。"""
+"""Flask 报送页：按月份、资源号、馆号上传 JSON，支持换报、撤回、下载与月度读者规模预估展示。"""
 
 from __future__ import annotations
 
@@ -102,6 +102,7 @@ def create_app(db_path: str | None = None) -> Flask:
             error=request.args.get("error"),
             status=request.args.get("status"),
             message=request.args.get("message"),
+            merged_list=get_db().list_merged(),
         )
 
     @app.get("/health")
@@ -125,7 +126,10 @@ def create_app(db_path: str | None = None) -> Flask:
                 url_for(
                     "index",
                     status=0,
-                    message=f"馆 {branch} {action}成功，合并摘要已同步更新",
+                    message=(
+                        f"馆 {branch} {action}成功，合并摘要已同步更新，"
+                        f"月度读者规模预估 {result['estimate']:.2f}"
+                    ),
                 )
             )
         response = jsonify(result)
@@ -152,7 +156,10 @@ def create_app(db_path: str | None = None) -> Flask:
                 url_for(
                     "index",
                     status=0,
-                    message=f"馆 {branch} 已撤回 {month} 资源 {resource} 的报送",
+                    message=(
+                        f"馆 {branch} 已撤回 {month} 资源 {resource} 的报送，"
+                        f"月度读者规模预估 {result['estimate']:.2f}"
+                    ),
                 )
             )
         return jsonify(result)

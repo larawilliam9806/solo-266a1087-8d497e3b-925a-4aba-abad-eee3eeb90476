@@ -1,5 +1,6 @@
 import io
 import json
+import math
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -9,7 +10,7 @@ import pytest
 from app import create_app
 from app.db import Database
 from app.errors import NotFoundError, ValidationError
-from app.hll import REGISTER_COUNT, build_summary, hll_register
+from app.hll import REGISTER_COUNT, build_summary, estimate_readers, hll_register
 
 ZERO = [0] * REGISTER_COUNT
 
@@ -291,6 +292,148 @@ def test_concurrent_replace_and_withdraw_converges(db):
     assert sum(merged) == 50
 
 
+# ---------- 月度读者规模预估 ----------
+
+def test_estimate_all_zero_summary_is_zero():
+    assert estimate_readers(ZERO) == 0.0
+
+
+def test_estimate_sparse_uses_empty_slot_correction():
+    # 稀疏摘要：按非零寄存器数做空槽修正，即线性计数 m·ln(m/V)，V 为空槽数
+    summary = regs({0: 1, 5: 2})
+    nonzero = 2
+    expected = round(
+        REGISTER_COUNT * math.log(REGISTER_COUNT / (REGISTER_COUNT - nonzero)), 2
+    )
+    assert estimate_readers(summary) == expected
+
+
+def test_estimate_dense_uses_raw_estimate():
+    # 原始估计超过 2.5m 时不做空槽修正，直接用标准原始估计
+    summary = [10] * REGISTER_COUNT
+    m = REGISTER_COUNT
+    alpha = 0.7213 / (1 + 1.079 / m)
+    raw = alpha * m * m / (m * 2.0 ** -10)
+    assert raw > 2.5 * m
+    assert estimate_readers(summary) == round(raw, 2)
+
+
+def test_estimate_two_decimals_and_reasonable_scale():
+    summary = build_summary([f"reader-{i}" for i in range(500)])
+    est = estimate_readers(summary)
+    assert est == round(est, 2)
+    # 500 个读者的 HLL-128 估计应落在合理区间（标准差约 9%）
+    assert 350 < est < 700
+
+
+def test_upsert_persists_estimate_with_merged(db):
+    r = db.upsert_report("2026-11", "ER-1", "LIB-A", regs({0: 5, 1: 3}))
+    expected = estimate_readers(regs({0: 5, 1: 3}))
+    assert r["estimate"] == expected
+    assert db.get_merged("2026-11", "ER-1")["estimate"] == expected
+
+
+def test_replace_and_withdraw_keep_estimate_in_sync(db):
+    db.upsert_report("2026-11", "ER-1", "LIB-A", regs({0: 5}))
+    db.upsert_report("2026-11", "ER-1", "LIB-B", regs({0: 9, 2: 4}))
+
+    # 换报改变摘要后，返回值与落库预估一致
+    r = db.upsert_report("2026-11", "ER-1", "LIB-A", regs({1: 7}))
+    assert r["estimate"] == estimate_readers(r["merged"])
+    assert db.get_merged("2026-11", "ER-1")["estimate"] == r["estimate"]
+
+    # 撤回改变摘要后同理
+    r = db.withdraw_report("2026-11", "ER-1", "LIB-B")
+    assert r["estimate"] == estimate_readers(r["merged"])
+    assert db.get_merged("2026-11", "ER-1")["estimate"] == r["estimate"]
+
+    # 全部撤回后摘要全零，预估直接为 0
+    r = db.withdraw_report("2026-11", "ER-1", "LIB-A")
+    assert r["merged"] == ZERO
+    assert r["estimate"] == 0.0
+    assert db.get_merged("2026-11", "ER-1")["estimate"] == 0.0
+
+
+def test_estimate_failure_rolls_back_whole_change(db, monkeypatch):
+    db.upsert_report("2026-11", "ER-1", "LIB-A", regs({0: 5}))
+    before = db.get_merged("2026-11", "ER-1")
+
+    def failing_estimate(registers):
+        raise ArithmeticError("simulated estimate failure")
+
+    monkeypatch.setattr("app.db.estimate_readers", failing_estimate)
+    with pytest.raises(ArithmeticError):
+        db.upsert_report("2026-11", "ER-1", "LIB-A", regs({0: 40}))
+    with pytest.raises(ArithmeticError):
+        db.withdraw_report("2026-11", "ER-1", "LIB-A")
+    monkeypatch.undo()
+
+    # 馆报、合并摘要与预估都沿用原数据
+    assert db.get_report("2026-11", "ER-1", "LIB-A")["registers"] == regs({0: 5})
+    after = db.get_merged("2026-11", "ER-1")
+    assert after["registers"] == before["registers"]
+    assert after["estimate"] == before["estimate"]
+
+
+def test_commit_failure_keeps_original_estimate(db, monkeypatch):
+    db.upsert_report("2026-11", "ER-1", "LIB-A", regs({0: 5}))
+    before = db.get_merged("2026-11", "ER-1")
+
+    def failing_commit(conn):
+        raise sqlite3.OperationalError("simulated commit failure")
+
+    monkeypatch.setattr(Database, "_commit", staticmethod(failing_commit))
+    with pytest.raises(sqlite3.OperationalError):
+        db.upsert_report("2026-11", "ER-1", "LIB-A", regs({0: 40}))
+    monkeypatch.undo()
+
+    after = db.get_merged("2026-11", "ER-1")
+    assert after["registers"] == before["registers"]
+    assert after["estimate"] == before["estimate"]
+
+
+def test_legacy_summary_without_estimate_is_filled_on_read(db):
+    # 旧摘要没有预估字段（estimate 为 NULL）：读取时按寄存器即时补出
+    db.upsert_report("2026-11", "ER-1", "LIB-A", regs({0: 5, 3: 2}))
+    conn = sqlite3.connect(db.path)
+    conn.execute("UPDATE merged_summaries SET estimate = NULL")
+    conn.commit()
+    conn.close()
+
+    merged = db.get_merged("2026-11", "ER-1")
+    assert merged["estimate"] == estimate_readers(regs({0: 5, 3: 2}))
+    listed = db.list_merged()
+    assert len(listed) == 1
+    assert listed[0]["estimate"] == merged["estimate"]
+    assert listed[0]["nonzero_registers"] == 2
+
+
+def test_legacy_db_without_estimate_column_is_migrated(tmp_path):
+    # 旧版库（merged_summaries 无 estimate 列）打开后自动补列，旧行预估即时补出
+    path = str(tmp_path / "legacy.sqlite3")
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE merged_summaries ("
+        "  month TEXT NOT NULL, resource TEXT NOT NULL, registers TEXT NOT NULL,"
+        "  updated_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00.000Z',"
+        "  PRIMARY KEY (month, resource)) WITHOUT ROWID"
+    )
+    conn.execute(
+        "INSERT INTO merged_summaries (month, resource, registers) VALUES (?, ?, ?)",
+        ("2026-11", "ER-1", json.dumps(regs({0: 4}))),
+    )
+    conn.commit()
+    conn.close()
+
+    legacy_db = Database(path)
+    merged = legacy_db.get_merged("2026-11", "ER-1")
+    assert merged["estimate"] == estimate_readers(regs({0: 4}))
+    # 迁移后新报送正常在事务内写入预估
+    r = legacy_db.upsert_report("2026-11", "ER-1", "LIB-A", regs({0: 6}))
+    assert r["estimate"] == estimate_readers(regs({0: 6}))
+    assert legacy_db.get_merged("2026-11", "ER-1")["estimate"] == r["estimate"]
+
+
 # ---------- HTTP 接口 ----------
 
 def _payload(branch="LIB-A", reg_overrides=None):
@@ -365,3 +508,34 @@ def test_http_get_branch_report_and_health(client):
     assert r.get_json()["registers"][2] == 8
     assert client.get("/health").status_code == 200
     assert client.get("/").status_code == 200
+
+
+def test_http_submit_response_includes_estimate(client):
+    r = client.post("/reports", json=_payload(reg_overrides={0: 5}))
+    assert r.status_code == 201
+    assert r.get_json()["estimate"] == estimate_readers(regs({0: 5}))
+
+
+def test_http_page_and_download_share_same_estimate(client):
+    # 报送后：页面表格与下载 JSON 是同一版预估
+    client.post("/reports", json=_payload(reg_overrides={0: 5, 2: 9}))
+    body = client.get("/merged/2026-11/ER-1/download").get_json()
+    assert body["estimate"] == estimate_readers(regs({0: 5, 2: 9}))
+    page = client.get("/").get_data(as_text=True)
+    assert f"{body['estimate']:.2f}" in page
+
+    # 换报改变摘要后：页面与下载 JSON 仍看到同一版预估
+    client.post("/reports", json=_payload(reg_overrides={0: 7, 1: 3}))
+    body = client.get("/merged/2026-11/ER-1/download").get_json()
+    assert body["estimate"] == estimate_readers(regs({0: 7, 1: 3}))
+    page = client.get("/").get_data(as_text=True)
+    assert f"{body['estimate']:.2f}" in page
+
+    # 撤回后亦然：摘要全零，预估为 0.00
+    client.post("/reports/withdraw", json={
+        "month": "2026-11", "resource": "ER-1", "branch": "LIB-A"
+    })
+    body = client.get("/merged/2026-11/ER-1/download").get_json()
+    assert body["estimate"] == 0.0
+    page = client.get("/").get_data(as_text=True)
+    assert "0.00" in page

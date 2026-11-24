@@ -9,8 +9,9 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
 from .errors import ValidationError
 
@@ -43,6 +44,35 @@ def build_summary(reader_ids: Iterable[str]) -> list[int]:
         if rank > registers[position]:
             registers[position] = rank
     return registers
+
+
+# 标准原始估计的偏差修正常数（m >= 128 时）：α = 0.7213 / (1 + 1.079 / m)
+_ALPHA_NUMERATOR = 0.7213
+_ALPHA_DENOM_OFFSET = 1.079
+# 稀疏摘要判定阈值：原始估计不超过 2.5 倍寄存器数时改做空槽修正
+_SPARSE_THRESHOLD = 2.5
+
+
+def estimate_readers(registers: Sequence[int]) -> float:
+    """按合并摘要的 128 个寄存器预估月度去重读者规模，结果保留两位小数。
+
+    - 全零摘要直接给 0；
+    - 标准原始估计 E = α·m² / Σ 2^(-M[j])；
+    - 稀疏摘要（E ≤ 2.5m 且仍有空槽）按非零寄存器数做空槽修正，
+      即线性计数 m·ln(m/V)，V 为空槽（取值 0）寄存器数 = m − 非零寄存器数。
+    """
+    values = list(registers)
+    m = len(values)
+    nonzero = sum(1 for value in values if value)
+    if m == 0 or nonzero == 0:
+        return 0.0  # 全零摘要直接给 0
+    alpha = _ALPHA_NUMERATOR / (1.0 + _ALPHA_DENOM_OFFSET / m)
+    indicator = sum(2.0 ** -value for value in values)
+    raw = alpha * m * m / indicator
+    zero_count = m - nonzero
+    if raw <= _SPARSE_THRESHOLD * m and zero_count:
+        return round(m * math.log(m / zero_count), 2)
+    return round(raw, 2)
 
 
 def validate_month(value: object) -> str:

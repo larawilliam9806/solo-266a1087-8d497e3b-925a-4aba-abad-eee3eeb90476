@@ -14,7 +14,10 @@ register_counts
     馆的摘要。最大值馆撤回或降值时，次大值可直接从直方图恢复。
 
 merged_summaries
-    按 (月份, 资源号) 保存的合并摘要，与馆报在同一事务内一并生效。
+    按 (月份, 资源号) 保存的合并摘要与月度读者规模预估（estimate），
+    与馆报在同一事务内一并生效；预估失败或落库失败即整体回滚，
+    库内仍保留原摘要与原预估。旧行可能没有预估字段（estimate 为 NULL），
+    读取时按寄存器即时补出，页面与下载 JSON 看到的始终是同一版数值。
 """
 
 from __future__ import annotations
@@ -26,7 +29,13 @@ import time
 from typing import Any
 
 from .errors import NotFoundError
-from .hll import REGISTER_COUNT, validate_identifier, validate_month, validate_registers
+from .hll import (
+    REGISTER_COUNT,
+    estimate_readers,
+    validate_identifier,
+    validate_month,
+    validate_registers,
+)
 
 SCHEMA = """
 PRAGMA journal_mode = WAL;
@@ -54,6 +63,7 @@ CREATE TABLE IF NOT EXISTS merged_summaries (
     month      TEXT NOT NULL,
     resource   TEXT NOT NULL,
     registers  TEXT NOT NULL,
+    estimate   REAL,
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     PRIMARY KEY (month, resource)
 ) WITHOUT ROWID;
@@ -91,9 +101,24 @@ class Database:
             conn = self._connect()
             try:
                 conn.executescript(SCHEMA)
+                self._migrate(conn)
             finally:
                 conn.close()
             self._initialized = True
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """旧库迁移：merged_summaries 可能还没有 estimate 列，按需补上。
+
+        旧行的 estimate 保持 NULL，读取时按寄存器即时补出；
+        下一次换报/撤回会在事务内写入新预估。
+        """
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(merged_summaries)").fetchall()
+        }
+        if "estimate" not in columns:
+            conn.execute("ALTER TABLE merged_summaries ADD COLUMN estimate REAL")
 
     # -- 事务工具 -------------------------------------------------------
 
@@ -159,8 +184,12 @@ class Database:
     @staticmethod
     def _refresh_merged(
         conn: sqlite3.Connection, month: str, resource: str
-    ) -> list[int]:
-        """从取值直方图聚合（逐位置 MAX）并落盘合并摘要，与馆报同事务生效。"""
+    ) -> tuple[list[int], float]:
+        """从取值直方图聚合（逐位置 MAX），重算预估并落盘合并摘要。
+
+        预估与摘要在同一事务内一并生效：预估计算或落库失败都会向上抛出，
+        整次变更回滚到原摘要和原预估。
+        """
         merged = [0] * REGISTER_COUNT
         rows = conn.execute(
             "SELECT position, MAX(value) AS value FROM register_counts "
@@ -169,15 +198,17 @@ class Database:
         ).fetchall()
         for row in rows:
             merged[row["position"]] = row["value"]
+        estimate = estimate_readers(merged)
         payload = json.dumps(merged, separators=(",", ":"))
         conn.execute(
-            "INSERT INTO merged_summaries (month, resource, registers, updated_at) "
-            "VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) "
+            "INSERT INTO merged_summaries (month, resource, registers, estimate, updated_at) "
+            "VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) "
             "ON CONFLICT (month, resource) DO UPDATE SET "
-            "registers = excluded.registers, updated_at = excluded.updated_at",
-            (month, resource, payload),
+            "registers = excluded.registers, estimate = excluded.estimate, "
+            "updated_at = excluded.updated_at",
+            (month, resource, payload, estimate),
         )
-        return merged
+        return merged, estimate
 
     # -- 对外操作 --------------------------------------------------------
 
@@ -232,7 +263,7 @@ class Database:
                         json.dumps(registers, separators=(",", ":")),
                     ),
                 )
-                merged = self._refresh_merged(conn, month, resource)
+                merged, estimate = self._refresh_merged(conn, month, resource)
                 self._commit(conn)
             except BaseException:
                 conn.rollback()
@@ -246,6 +277,7 @@ class Database:
             "branch": branch,
             "registers": registers,
             "merged": merged,
+            "estimate": estimate,
             "replaced": old_registers is not None,
         }
 
@@ -284,7 +316,7 @@ class Database:
                     "WHERE month = ? AND resource = ? AND branch = ?",
                     (month, resource, branch),
                 )
-                merged = self._refresh_merged(conn, month, resource)
+                merged, estimate = self._refresh_merged(conn, month, resource)
                 self._commit(conn)
             except BaseException:
                 conn.rollback()
@@ -297,17 +329,22 @@ class Database:
             "resource": resource,
             "branch": branch,
             "merged": merged,
+            "estimate": estimate,
         }
 
     def get_merged(self, month: str, resource: str) -> dict[str, Any]:
-        """读取已保存的合并摘要（无任何报送记录时 404）。"""
+        """读取已保存的合并摘要与预估（无任何报送记录时 404）。
+
+        旧摘要可能没有预估字段（estimate 为 NULL），按寄存器即时补出，
+        保证页面与下载 JSON 看到的预估口径一致。
+        """
         month = validate_month(month)
         resource = validate_identifier("resource", resource)
 
         conn = self._connect()
         try:
             row = conn.execute(
-                "SELECT registers, updated_at FROM merged_summaries "
+                "SELECT registers, estimate, updated_at FROM merged_summaries "
                 "WHERE month = ? AND resource = ?",
                 (month, resource),
             ).fetchone()
@@ -315,12 +352,47 @@ class Database:
             conn.close()
         if row is None:
             raise NotFoundError(f"{month} 资源 {resource} 尚无任何报送，没有合并摘要")
+        registers = json.loads(row["registers"])
         return {
             "month": month,
             "resource": resource,
-            "registers": json.loads(row["registers"]),
+            "registers": registers,
+            "estimate": self._stored_or_fresh_estimate(registers, row["estimate"]),
             "updated_at": row["updated_at"],
         }
+
+    def list_merged(self) -> list[dict[str, Any]]:
+        """列出全部已保存的合并摘要预估，供联盟页面展示（按月份倒序、资源号排序）。"""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT month, resource, registers, estimate, updated_at "
+                "FROM merged_summaries ORDER BY month DESC, resource",
+            ).fetchall()
+        finally:
+            conn.close()
+        items = []
+        for row in rows:
+            registers = json.loads(row["registers"])
+            items.append(
+                {
+                    "month": row["month"],
+                    "resource": row["resource"],
+                    "nonzero_registers": sum(1 for value in registers if value),
+                    "estimate": self._stored_or_fresh_estimate(
+                        registers, row["estimate"]
+                    ),
+                    "updated_at": row["updated_at"],
+                }
+            )
+        return items
+
+    @staticmethod
+    def _stored_or_fresh_estimate(registers: list[int], estimate: Any) -> float:
+        """优先使用已落库的预估；旧摘要没有预估字段时按寄存器即时补出。"""
+        if estimate is None:
+            return estimate_readers(registers)
+        return float(estimate)
 
     def get_report(
         self, month: str, resource: str, branch: str
